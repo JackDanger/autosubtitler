@@ -1,0 +1,17 @@
+[tool.poetry]
+name = "autosubtitler"
+version = "0.1.0"
+description = "Automatically translate subtitles to English"
+authors = ["Jack Danger <github@jackdanger.com>"]
+license = "MIT"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = ">= 3.9"
+google-genai = "^0.3.0"
+openai = "^1.59.3"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
