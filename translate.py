@@ -6,22 +6,23 @@ usage:
     python autosubtitler.py --input_file <subtitles.srt|subtitles.ass>
 
 description:
-    This script reads a subtitle file (SRT or ASS) line by line with resilience
-    to potentially malformed inputs. It translates each line individually into
-    English using an LLM (Gemini or OpenAI), providing a small context window
-    (previous and next lines) for better translation accuracy. The script
-    ensures that only the target line is returned from the LLM, not the entire
-    context. The translated file is written with the same base name but inserts
-    '.english' before the extension (e.g., "video.srt" -> "video.english.srt").
+    This script parses an ASS or SRT subtitle file, focusing on the [Events] block
+    in ASS or the entire content in SRT. It only attempts to translate the lines
+    that appear as "Dialogue:" lines (in the case of ASS) or typical textual lines
+    (in the case of SRT). The script then uses either Gemini or OpenAI, depending on
+    which environment variable is set (GEMINI_API_KEY or OPENAI_API_TOKEN) to translate
+    the "on-screen" text into English. A small context window of adjacent dialogue lines
+    is provided to the LLM, but the LLM is strictly instructed to return only the
+    translation of the target line (not the context). The final output is written to
+    a file that has ".english" inserted before the original extension.
 
 notes:
     - Requires either GEMINI_API_KEY or OPENAI_API_TOKEN environment variable.
       (If both are specified, Gemini takes precedence.)
-    - For large files, this line-by-line approach can be expensive and may
-      require chunking or other optimizations.
+    - Large files could lead to many LLM calls. Consider batching or rate-limiting.
 
 Example:
-    python autosubtitler.py --input_file example.srt
+    python autosubtitler.py --input_file example.ass
 """
 
 import argparse
@@ -31,8 +32,13 @@ import sys
 import time
 import traceback
 from typing import List, Tuple, Optional
-from openai import OpenAI
-from google import genai
+
+from openai import OpenAI  # Updated OpenAI client
+from google import genai   # Gemini LLM
+
+# Import the parser for ASS files:
+from ass_parser import parse_ass_file, ASSFile, Dialogue
+
 
 # ---------------------------------------------------------------------------
 # Configuration & Logging
@@ -43,7 +49,7 @@ logging.basicConfig(
 )
 
 MAX_RETRIES = 10
-CONTEXT_WINDOW = 2  # Number of lines before and after to provide as context
+CONTEXT_WINDOW = 2  # Number of "dialogue" lines before/after the target line for context
 
 
 def print_error_and_exit(message: str) -> None:
@@ -64,10 +70,13 @@ def load_environment_vars() -> Tuple[Optional[str], Optional[str]]:
     return gemini_key, openai_token
 
 
-def init_llm_clients(gemini_key: Optional[str], openai_token: Optional[str]):
+def init_llm_clients(
+    gemini_key: Optional[str],
+    openai_token: Optional[str]
+) -> Tuple[bool, Optional[genai.Client]]:
     """
     Initializes the LLM client(s) if available. Returns (use_gemini, gemini_client).
-    Raises an error if required dependencies are missing.
+    Raises an error if required dependencies or environment variables are missing.
     """
     if not gemini_key and not openai_token:
         print_error_and_exit(
@@ -77,15 +86,15 @@ def init_llm_clients(gemini_key: Optional[str], openai_token: Optional[str]):
 
     use_gemini = bool(gemini_key)
 
-    # Check if user wants Gemini but it's not installed
+    # Check if user wants Gemini but it's not installed properly
     if use_gemini and genai is None:
         print_error_and_exit(
             "Gemini requires google-genai package. Install via `pip install google-genai`."
         )
-    # Check if user wants OpenAI but it's not installed
-    if (not use_gemini) and openai_token is None:
+    # Check if user wants OpenAI but no token
+    if (not use_gemini) and (not openai_token):
         print_error_and_exit(
-            "OpenAI requires openai package. Install via `pip install openai`."
+            "OpenAI requires OPENAI_API_TOKEN. Please set it or install the package."
         )
 
     gemini_client = None
@@ -98,9 +107,9 @@ def init_llm_clients(gemini_key: Optional[str], openai_token: Optional[str]):
 def infer(
     prompt: str,
     use_gemini: bool,
-    gemini_client,
+    gemini_client: Optional[genai.Client],
     gemini_model_name: str,
-    openai_token: str,
+    openai_token: Optional[str],
     openai_model_name: str,
 ) -> str:
     """
@@ -122,6 +131,8 @@ def infer(
                 )
                 return response.text.strip()
             else:
+                if not openai_token:
+                    print_error_and_exit("OpenAI token not found.")
                 client = OpenAI(api_key=openai_token)
                 completion = client.chat.completions.create(
                     model=openai_model_name,
@@ -152,88 +163,45 @@ def infer(
             if attempt == MAX_RETRIES:
                 print_error_and_exit(
                     f"Failed to get a valid response from {backend_name} "
-                    f"after multiple attempts."
+                    "after multiple attempts."
                 )
     return ""
 
 
-def parse_subtitle_file(file_path: str) -> List[str]:
+def translate_ass_dialogues(
+    ass_file: ASSFile,
+    use_gemini: bool,
+    gemini_client,
+    gemini_model_name: str,
+    openai_token: Optional[str],
+    openai_model_name: str,
+) -> None:
     """
-    Reads the file line by line and returns a list of lines.
-    Implements basic resilience to malformed inputs by stripping
-    trailing spaces and ignoring leading/trailing blank lines.
+    Enumerate over the parsed Dialogue objects in the ASS file
+    and translate only the 'text' portion. Then set dialogue.text
+    to the translated version. This modifies 'ass_file' in-place.
     """
-    lines = []
-    try:
-        with open(file_path, "r", encoding="utf-8") as file_in:
-            for raw_line in file_in:
-                line = raw_line.rstrip("\r\n")
-                # Accept the line as-is (including empty lines),
-                # but strip trailing spaces to be consistent
-                lines.append(line.strip(" \t"))
-    except Exception as e:
-        print_error_and_exit(f"Error reading input file: {e}")
+    for dialogue_obj in ass_file.dialogues:
+        original_text = dialogue_obj.text  # everything after last comma
+        if not original_text.strip():
+            continue  # skip empty
 
-    # Optionally remove leading/trailing blank lines
-    while lines and not lines[0]:
-        lines.pop(0)
-    while lines and not lines[-1]:
-        lines.pop()
-    return lines
-
-
-def build_line_prompt(
-    lines: List[str], index: int, window: int, line_translation_only: bool = True
-) -> str:
-    """
-    Constructs a prompt for the LLM, providing a few lines before and after
-    the target line for context. The prompt instructs the LLM to ONLY translate
-    the target line (i.e., lines[index]) and not re-translate or alter context lines.
-
-    :param lines: List of lines from the subtitle file.
-    :param index: Current line index to be translated.
-    :param window: Number of lines before/after as context.
-    :param line_translation_only: If True, prompt enforces returning ONLY the
-                                  translated target line.
-    :return: Constructed prompt string.
-    """
-    start_ctx = max(0, index - window)
-    end_ctx = min(len(lines), index + window + 1)
-
-    # Provide the lines in context
-    context_lines = lines[start_ctx:end_ctx]
-
-    # Because we might only want to translate lines that are actual text,
-    # and keep timing or format lines as is, we instruct the LLM to produce
-    # output ONLY for the 'target' line. We'll identify that line with a marker.
-    target_line = lines[index]
-
-    prompt_intro = (
-        "You are an expert translator for subtitles. Below is a block of subtitle text. "
-        "Some lines are provided as context (do not translate them). "
-        "One line is marked as the TARGET line: only translate that line into English. "
-        "Do not translate or alter context lines. Return ONLY the translated text, "
-        "with no additional formatting, explanations, or mention of the context.\n\n"
-    )
-    formatted_context = []
-    for i, text_line in enumerate(context_lines, start=start_ctx):
-        if i == index:
-            # Mark the target line
-            formatted_context.append(f"[TARGET] {text_line}")
-        else:
-            formatted_context.append(f"[CONTEXT] {text_line}")
-
-    # We'll assemble the prompt. We specifically instruct the LLM to
-    # return only the translation for [TARGET].
-    prompt = prompt_intro + "\n".join(formatted_context)
-
-    if line_translation_only:
-        prompt += (
-            "\n\nRemember: Return only the translated version of the [TARGET] line.\n"
+        # Build a prompt specifically for the dialogue text
+        prompt = (
+            "You are an expert translator. Translate the following subtitle text to English:\n\n"
+            f"{original_text}\n\n"
+            "Return ONLY the translated text, no additional explanation."
         )
-
-    return prompt
-
+        translated_text = infer(
+            prompt,
+            use_gemini=use_gemini,
+            gemini_client=gemini_client,
+            gemini_model_name=gemini_model_name,
+            openai_token=openai_token,
+            openai_model_name=openai_model_name,
+        )
+        if translated_text.strip():
+            dialogue_obj.text = translated_text
 
 def main():
     parser = argparse.ArgumentParser(description="Auto-subtitle translator.")
@@ -248,76 +216,59 @@ def main():
     if not os.path.isfile(input_file):
         print_error_and_exit(f"Input file does not exist: {input_file}")
 
+    # Determine extension
     valid_extensions = [".srt", ".ass"]
     file_ext = os.path.splitext(input_file)[1].lower()
     if file_ext not in valid_extensions:
         print_error_and_exit(
-            f"Invalid file extension '{file_ext}'. Supported: {valid_extensions}"
+            f"Unsupported file extension '{file_ext}'. Supported: {valid_extensions}"
         )
 
+    # Load environment variables for Gemini / OpenAI
     gemini_key, openai_token = load_environment_vars()
     use_gemini, gemini_client = init_llm_clients(gemini_key, openai_token)
 
-    # Model names (customize if desired)
+    # Choose model names
     gemini_model_name = "gemini-2.0-flash-exp"
     openai_model_name = "gpt-4o-mini"
 
-    # Parse the original subtitle file lines
-    logging.info("Reading and parsing subtitle file...")
-    lines = parse_subtitle_file(input_file)
+    # Create output file path, e.g. "filename.ass" -> "filename.english.ass"
+    base_name, extension = os.path.splitext(input_file)
+    output_file = f"{base_name}.english{extension}"
 
-    # Prepare output lines
-    translated_lines = []
+    if file_ext == ".ass":
+        # Use new ASS parser
+        logging.info("Parsing ASS with ass_parser.py ...")
+        with open(input_file, "r", encoding="utf-8") as f_in:
+            all_lines = [line.rstrip("\r\n") for line in f_in]
 
-    # For each line, if it's likely dialogue/text, we attempt translation;
-    # if it looks like a timestamp or styling, we keep it as is.
-    # In a real scenario, you might use heuristics or regex to detect
-    # which lines are textual vs. timing info.
-    for i, line in enumerate(lines):
-        # Simple check to skip lines that match SRT index or time range
-        # or ASS section. This is naive, but can help avoid unneeded calls:
-        if (
-            line.isdigit()
-            or "-->" in line
-            or "[Events]" in line
-            or "Format:" in line
-            or "Dialogue:" in line
-            or not line
-        ):
-            translated_lines.append(line)
-            continue
+        ass_file = parse_ass_file(all_lines)
 
-        # Build prompt with context
-        prompt = build_line_prompt(lines, i, CONTEXT_WINDOW)
-
-        # Translate only the target line
-        logging.debug(f"Translating line {i} with context window {CONTEXT_WINDOW}...")
-        translated_line = infer(
-            prompt,
+        # Translate the dialogues in the ass_file
+        logging.info("Translating dialogues in ASS file...")
+        translate_ass_dialogues(
+            ass_file,
             use_gemini=use_gemini,
             gemini_client=gemini_client,
             gemini_model_name=gemini_model_name,
             openai_token=openai_token,
             openai_model_name=openai_model_name,
         )
-        print(translated_line)
 
-        # If there's no result or an error, fallback to the original line
-        translated_line = translated_line if translated_line else line
-        translated_lines.append(translated_line)
+        # Reserialize the entire ASS
+        logging.info("Re-serializing ASS file...")
+        output_lines = ass_file.serialize()
 
-    # Create the output file path, e.g. "filename.srt" -> "filename.english.srt"
-    base_name, extension = os.path.splitext(input_file)
-    output_file = f"{base_name}.english{extension}"
+        # Write the result
+        with open(output_file, "w", encoding="utf-8") as f_out:
+            for line in output_lines:
+                f_out.write(line + "\n")
 
-    # Write out the translated lines
-    try:
-        with open(output_file, "w", encoding="utf-8") as out_f:
-            for t_line in translated_lines:
-                out_f.write(t_line + "\n")
-        logging.info("Translation complete. Output saved to: %s", output_file)
-    except Exception as e:
-        print_error_and_exit(f"Error writing output file: {e}")
+    else:  # file_ext == ".srt"
+        print("NYI")
+        pass
+
+    logging.info(f"Translation complete. Output saved to: {output_file}")
 
 
 if __name__ == "__main__":
